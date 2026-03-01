@@ -16,6 +16,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
+#include <LittleFS.h>          // NEW: Session persistence to flash
 #include <TinyGPSPlus.h>    
 #include <HardwareSerial.h> 
 #include <freertos/FreeRTOS.h> 
@@ -41,45 +42,61 @@ HardwareSerial SerialGPS(1);
 #define LOW_FREQ 200
 #define HIGH_FREQ 800
 #define DETECT_FREQ 1000  
+#define DETECT_FREQ_HIGH 1200
+#define DETECT_FREQ_CERTAIN 1500
 #define BOOT_BEEP_DURATION 300
 #define DETECT_BEEP_DURATION 150
 
 #define MAX_CHANNEL 13
-#define CHANNEL_HOP_INTERVAL 350   // PERF: Reduced from 500ms - faster channel cycling
-#define BLE_SCAN_DURATION 2        // PERF: Increased from 1s - catch more BLE adverts per scan
-#define BLE_SCAN_INTERVAL 3000     // PERF: Reduced from 5000ms - scan BLE more often
+#define BLE_SCAN_DURATION 2
+#define BLE_SCAN_INTERVAL 3000
 #define BUZZER_COOLDOWN 60000 
-#define LOG_UPDATE_DELAY 500       // PERF: Reduced from 1000ms - more responsive live feed
+#define LOG_UPDATE_DELAY 500
 #define IGNORE_WEAK_RSSI -80  
 
 #define MAX_LOG_BUFFER 10          
 #define SD_FLUSH_INTERVAL 10000    
 
-// ============================================================================
-// CONFIDENCE SCORING THRESHOLDS
-// ============================================================================
-// Each detection method contributes points. We alarm at CONFIDENCE_ALARM_THRESHOLD.
-// This prevents single weak-signal OUI matches from triggering false positives.
+// --- Adaptive channel dwell times (milliseconds) ---
+#define DWELL_PRIMARY   500    // Channels 1, 6, 11 (non-overlapping, where Flock cameras most likely operate)
+#define DWELL_SECONDARY 200    // All other channels
 
-#define CONF_MAC_PREFIX       40   // Known OUI prefix match
-#define CONF_SSID_PATTERN     50   // SSID matches known Flock pattern
-#define CONF_BLE_NAME         45   // BLE device name matches known pattern
-#define CONF_MFG_ID           60   // Manufacturer company ID 0x09C8 (XUNTONG) - very specific
-#define CONF_RAVEN_UUID       70   // Raven service UUID match - highly specific
-#define CONF_RAVEN_MULTI_UUID 90   // Multiple Raven UUIDs from one device - near certain
-#define CONF_PENGUIN_SERIAL   80   // XUNTONG mfg data with TN serial number pattern
+// --- Time-windowed re-detection ---
+#define REDETECT_WINDOW_MS 300000   // 5 minutes: re-log same MAC after this interval (fresh GPS coords)
 
-// Bonus modifiers
-#define CONF_BONUS_STRONG_RSSI  10  // Signal > -50 dBm (very close)
-#define CONF_BONUS_MULTI_METHOD 20  // Multiple independent methods match same device
+// --- RSSI trend tracking ---
+#define RSSI_TRACK_MAX_DEVICES 16   // Max devices tracked simultaneously
+#define RSSI_TRACK_SAMPLES 5        // Samples to keep per device
+#define RSSI_TRACK_EXPIRY_MS 15000  // Expire tracking after 15s of no sightings
+#define CONF_BONUS_STATIONARY 15    // Bonus for stationary RF signature (rise-peak-fall)
 
-// Thresholds
-#define CONFIDENCE_ALARM_THRESHOLD 40   // Minimum to trigger alarm (allows single MAC match)
-#define CONFIDENCE_HIGH    70   // "HIGH" confidence label
-#define CONFIDENCE_CERTAIN 85   // "CERTAIN" confidence label
+// --- Session persistence ---
+#define PERSIST_INTERVAL_MS 60000   // Save to flash every 60 seconds
+#define PERSIST_FILE "/flock_session.dat"
 
 // ============================================================================
-// DUAL-CORE & GLOBAL VARIABLES
+// CONFIDENCE SCORING
+// ============================================================================
+
+#define CONF_MAC_PREFIX       40
+#define CONF_SSID_PATTERN     50
+#define CONF_SSID_FLOCK_FMT   65   // NEW: Specific "Flock-XXXX" hex format (higher than generic substring)
+#define CONF_BLE_NAME         45
+#define CONF_MFG_ID           60
+#define CONF_RAVEN_UUID       70
+#define CONF_RAVEN_MULTI_UUID 90
+#define CONF_PENGUIN_SERIAL   80
+
+#define CONF_BONUS_STRONG_RSSI  10
+#define CONF_BONUS_MULTI_METHOD 20
+#define CONF_BONUS_BLE_STATIC_ADDR 10  // NEW: Random static BLE address (consistent, not rotating)
+
+#define CONFIDENCE_ALARM_THRESHOLD 40
+#define CONFIDENCE_HIGH    70
+#define CONFIDENCE_CERTAIN 85
+
+// ============================================================================
+// GLOBAL VARIABLES
 // ============================================================================
 TaskHandle_t ScannerTaskHandle;
 SemaphoreHandle_t dataMutex; 
@@ -90,7 +107,7 @@ static unsigned long last_ble_scan = 0;
 static unsigned long last_buzzer_time = 0; 
 static NimBLEScan* pBLEScan;
 bool sd_available = false;
-volatile bool trigger_alarm = false; 
+volatile int trigger_alarm_confidence = 0;  // CHANGED: stores confidence level for escalated alarm
 
 std::vector<String> sd_write_buffer;
 unsigned long last_sd_flush = 0;
@@ -108,10 +125,15 @@ unsigned long session_start_time = 0;
 long lifetime_wifi = 0;
 long lifetime_ble = 0;
 unsigned long lifetime_seconds = 0;
+long lifetime_flock_total = 0;
 
-// Seen-MAC ring buffer (bounded memory, O(1) insert)
+// --- Time-windowed MAC dedup ring buffer ---
 #define MAX_SEEN_MACS 200
-String seen_macs[MAX_SEEN_MACS];
+struct SeenMAC {
+    String mac;
+    unsigned long timestamp;  // millis() when last logged
+};
+SeenMAC seen_macs[MAX_SEEN_MACS];
 int seen_macs_count = 0;
 int seen_macs_write_idx = 0;
 
@@ -128,6 +150,7 @@ unsigned long last_anim_update = 0;
 unsigned long last_stats_update = 0;
 unsigned long last_time_save = 0;
 unsigned long last_log_update = 0; 
+unsigned long last_persist_save = 0;
 int scan_line_x = 0;
 
 #define CHART_BARS 25
@@ -139,6 +162,17 @@ long session_flock_wifi = 0;
 long session_flock_ble = 0;
 long session_raven = 0;
 
+// --- RSSI trend tracker ---
+struct RSSITrack {
+    String mac;
+    int samples[RSSI_TRACK_SAMPLES];
+    int sample_count;
+    unsigned long last_seen;
+    bool scored;  // Already applied stationary bonus to this device
+};
+RSSITrack rssi_tracker[RSSI_TRACK_MAX_DEVICES];
+int rssi_tracker_count = 0;
+
 // ============================================================================
 // UI BITMAPS
 // ============================================================================
@@ -149,7 +183,6 @@ const unsigned char clock_icon[] PROGMEM = { 0x3C, 0x42, 0x42, 0x52, 0x4A, 0x42,
 // DETECTION SIGNATURE DATABASE
 // ============================================================================
 
-// --- WiFi SSID patterns (case-insensitive substring match) ---
 static const char* wifi_ssid_patterns[] = { 
     "flock", "Flock", "FLOCK", 
     "FS Ext Battery", "FS_",
@@ -158,58 +191,34 @@ static const char* wifi_ssid_patterns[] = {
 };
 static const int NUM_SSID_PATTERNS = sizeof(wifi_ssid_patterns) / sizeof(wifi_ssid_patterns[0]);
 
-// --- MAC OUI prefixes ---
-// Sourced from: deflock.me datasets, WiGLE.net verified captures, GainSec research,
-// Ryan O'Horo's Falcon V2 hardware analysis, FlockBack project, Colonel Panic field data.
-// 
-// These cover: Flock camera mainboards, LiteOn WiFi/BT chipsets (WCBN3510A),
-// Sierra Wireless LTE modems, Cradlepoint modems, Murata modules, Penguin batteries,
-// and Espressif-based external battery modules.
 static const char* mac_prefixes[] = { 
-    // === Flock Safety direct / camera mainboard ===
-    "58:8e:81",  "cc:cc:cc",  "ec:1b:bd",  "90:35:ea",
-    "f0:82:c0",  "1c:34:f1",  "38:5b:44",  "94:34:69",
-    "b4:e3:f9",  "3c:91:80",  "d8:f3:bc",  "80:30:49",
-    "14:5a:fc",  "9c:2f:9d",  "94:08:53",  "e4:aa:ea",
-    "48:e7:29",  // Newer hardware revision
-    "c8:c9:a3",  // Condor PTZ models
-    // === LiteOn Technology (WCBN3510A WiFi/BT in Falcon V2) ===
-    "74:4c:a1",  "70:c9:4e",
-    // === Cradlepoint / modem vendors ===
-    "04:0d:84",
-    // === Murata Manufacturing (BLE modules) ===
-    "08:3a:88",
-    // === Espressif (some Flock ext battery modules use ESP32) ===
-    "a4:cf:12",
-    // === Penguin battery BLE (random addresses start d8:a0:d8) ===
-    "d8:a0:d8",
+    "58:8e:81", "cc:cc:cc", "ec:1b:bd", "90:35:ea",
+    "f0:82:c0", "1c:34:f1", "38:5b:44", "94:34:69",
+    "b4:e3:f9", "3c:91:80", "d8:f3:bc", "80:30:49",
+    "14:5a:fc", "9c:2f:9d", "94:08:53", "e4:aa:ea",
+    "48:e7:29", "c8:c9:a3",
+    "74:4c:a1", "70:c9:4e",  // LiteOn
+    "04:0d:84",               // Cradlepoint
+    "08:3a:88",               // Murata
+    "a4:cf:12",               // Espressif
+    "d8:a0:d8",               // Penguin BLE
 };
 static const int NUM_MAC_PREFIXES = sizeof(mac_prefixes) / sizeof(mac_prefixes[0]);
 
-// --- BLE device name patterns ---
-// UPDATE 2025-03: Penguin firmware now drops "Penguin-" prefix.
-// New Penguin name is just a 10-digit decimal number (e.g., "1234567890").
-// We handle this separately with is_penguin_numeric_name() below.
 static const char* device_name_patterns[] = { 
-    "FS Ext Battery",
-    "Penguin",          // Still catches older firmware with "Penguin-NNNNNNNNNN"
-    "Flock",
-    "Pigvision",
-    "FlockCam",
-    "FS-",
+    "FS Ext Battery", "Penguin", "Flock", "Pigvision", "FlockCam", "FS-",
 };
 static const int NUM_NAME_PATTERNS = sizeof(device_name_patterns) / sizeof(device_name_patterns[0]);
 
-// --- Raven BLE Service UUIDs (full set from GainSec raven_configurations.json) ---
 static const char* raven_service_uuids[] = {
-    "0000180a-0000-1000-8000-00805f9b34fb",  // Device Information
-    "00003100-0000-1000-8000-00805f9b34fb",  // GPS Location
-    "00003200-0000-1000-8000-00805f9b34fb",  // Power Management
-    "00003300-0000-1000-8000-00805f9b34fb",  // Network Status
-    "00003400-0000-1000-8000-00805f9b34fb",  // Upload Statistics
-    "00003500-0000-1000-8000-00805f9b34fb",  // Error/Failure
-    "00001809-0000-1000-8000-00805f9b34fb",  // Health Thermometer (legacy 1.1.x)
-    "00001819-0000-1000-8000-00805f9b34fb",  // Location/Navigation (legacy 1.1.x)
+    "0000180a-0000-1000-8000-00805f9b34fb",
+    "00003100-0000-1000-8000-00805f9b34fb",
+    "00003200-0000-1000-8000-00805f9b34fb",
+    "00003300-0000-1000-8000-00805f9b34fb",
+    "00003400-0000-1000-8000-00805f9b34fb",
+    "00003500-0000-1000-8000-00805f9b34fb",
+    "00001809-0000-1000-8000-00805f9b34fb",
+    "00001819-0000-1000-8000-00805f9b34fb",
 };
 static const int NUM_RAVEN_UUIDS = sizeof(raven_service_uuids) / sizeof(raven_service_uuids[0]);
 
@@ -227,24 +236,6 @@ void beep(int frequency, int duration_ms) {
 void boot_beep_sequence() {
     beep(LOW_FREQ, BOOT_BEEP_DURATION);
     beep(HIGH_FREQ, BOOT_BEEP_DURATION);
-}
-
-void flush_sd_buffer() {
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    if (sd_write_buffer.empty() || !sd_available) {
-        xSemaphoreGive(dataMutex);
-        return;
-    }
-    std::vector<String> temp_buffer = sd_write_buffer;
-    sd_write_buffer.clear(); 
-    xSemaphoreGive(dataMutex); 
-    
-    File file = SD.open(current_log_file.c_str(), FILE_APPEND);
-    if (file) {
-        for (const String &line : temp_buffer) { file.println(line); }
-        file.close();
-        last_sd_flush = millis();
-    }
 }
 
 String format_time(unsigned long total_sec) {
@@ -265,9 +256,7 @@ String short_mac(const String& mac) {
 String bytesToHexStr(const std::string& data) {
     String res = "";
     for (size_t i = 0; i < data.length(); i++) {
-        char buf[4];
-        sprintf(buf, "%02X", (uint8_t)data[i]);
-        res += buf;
+        char buf[4]; sprintf(buf, "%02X", (uint8_t)data[i]); res += buf;
     }
     return res;
 }
@@ -281,21 +270,6 @@ String get_gps_datetime() {
     return String(dt);
 }
 
-bool is_mac_seen(const String& mac) {
-    int limit = min(seen_macs_count, MAX_SEEN_MACS);
-    for (int i = 0; i < limit; i++) {
-        if (seen_macs[i] == mac) return true;
-    }
-    return false;
-}
-
-void add_seen_mac(const String& mac) {
-    seen_macs[seen_macs_write_idx] = mac;
-    seen_macs_write_idx = (seen_macs_write_idx + 1) % MAX_SEEN_MACS;
-    if (seen_macs_count < MAX_SEEN_MACS) seen_macs_count++;
-}
-
-// Returns confidence label string for OLED display
 const char* confidence_label(int score) {
     if (score >= CONFIDENCE_CERTAIN) return "CERTAIN";
     if (score >= CONFIDENCE_HIGH) return "HIGH";
@@ -304,45 +278,215 @@ const char* confidence_label(int score) {
 }
 
 // ============================================================================
-// PENGUIN NUMERIC NAME DETECTION
+// SESSION PERSISTENCE (LittleFS)
 // ============================================================================
-// As of March 2025, Penguin battery firmware dropped the "Penguin-" prefix.
-// New BLE name is just a 10-digit decimal number (e.g., "1234567890").
-// This alone is LOW confidence — could be any device with a numeric name.
-// But combined with XUNTONG mfg ID (0x09C8), it becomes CERTAIN.
+
+void save_session_to_flash() {
+    File f = LittleFS.open(PERSIST_FILE, "w");
+    if (!f) return;
+    
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    f.printf("%ld\n%ld\n%lu\n%ld\n", lifetime_wifi, lifetime_ble, lifetime_seconds, lifetime_flock_total);
+    xSemaphoreGive(dataMutex);
+    
+    f.close();
+    last_persist_save = millis();
+}
+
+void load_session_from_flash() {
+    if (!LittleFS.exists(PERSIST_FILE)) return;
+    
+    File f = LittleFS.open(PERSIST_FILE, "r");
+    if (!f) return;
+    
+    String line;
+    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_wifi = line.toInt();
+    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_ble = line.toInt();
+    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_seconds = line.toInt();
+    line = f.readStringUntil('\n'); if (line.length() > 0) lifetime_flock_total = line.toInt();
+    
+    f.close();
+    Serial.print(F("Restored: WiFi=")); Serial.print(lifetime_wifi);
+    Serial.print(F(" BLE=")); Serial.print(lifetime_ble);
+    Serial.print(F(" Time=")); Serial.print(format_time(lifetime_seconds));
+    Serial.print(F(" Total=")); Serial.println(lifetime_flock_total);
+}
+
+// ============================================================================
+// TIME-WINDOWED MAC DEDUPLICATION
+// ============================================================================
+// Returns true if this MAC was seen recently (within REDETECT_WINDOW_MS).
+// If the MAC was seen but the window has expired, returns false (allowing re-detection).
+
+bool is_mac_recently_seen(const String& mac) {
+    unsigned long now = millis();
+    int limit = min(seen_macs_count, MAX_SEEN_MACS);
+    for (int i = 0; i < limit; i++) {
+        if (seen_macs[i].mac == mac) {
+            if ((now - seen_macs[i].timestamp) < REDETECT_WINDOW_MS) {
+                return true;  // Seen recently, suppress
+            } else {
+                // Window expired — update timestamp and allow re-detection
+                seen_macs[i].timestamp = now;
+                return false;
+            }
+        }
+    }
+    return false;  // Never seen
+}
+
+void add_seen_mac(const String& mac) {
+    seen_macs[seen_macs_write_idx].mac = mac;
+    seen_macs[seen_macs_write_idx].timestamp = millis();
+    seen_macs_write_idx = (seen_macs_write_idx + 1) % MAX_SEEN_MACS;
+    if (seen_macs_count < MAX_SEEN_MACS) seen_macs_count++;
+}
+
+// ============================================================================
+// RSSI TREND TRACKING
+// ============================================================================
+// Tracks RSSI over time for detected devices. A fixed installation produces a
+// characteristic rise-peak-fall curve as you drive past. A device in a passing
+// car appears and disappears abruptly at close range.
+
+void rssi_track_update(const String& mac, int rssi) {
+    unsigned long now = millis();
+    
+    // Find existing tracker
+    for (int i = 0; i < rssi_tracker_count; i++) {
+        if (rssi_tracker[i].mac == mac) {
+            if (rssi_tracker[i].sample_count < RSSI_TRACK_SAMPLES) {
+                rssi_tracker[i].samples[rssi_tracker[i].sample_count++] = rssi;
+            } else {
+                // Shift samples left, add new at end
+                for (int j = 0; j < RSSI_TRACK_SAMPLES - 1; j++) {
+                    rssi_tracker[i].samples[j] = rssi_tracker[i].samples[j + 1];
+                }
+                rssi_tracker[i].samples[RSSI_TRACK_SAMPLES - 1] = rssi;
+            }
+            rssi_tracker[i].last_seen = now;
+            return;
+        }
+    }
+    
+    // Expire oldest if full
+    if (rssi_tracker_count >= RSSI_TRACK_MAX_DEVICES) {
+        int oldest_idx = 0;
+        unsigned long oldest_time = rssi_tracker[0].last_seen;
+        for (int i = 1; i < rssi_tracker_count; i++) {
+            if (rssi_tracker[i].last_seen < oldest_time) {
+                oldest_time = rssi_tracker[i].last_seen;
+                oldest_idx = i;
+            }
+        }
+        // Overwrite oldest
+        rssi_tracker[oldest_idx].mac = mac;
+        rssi_tracker[oldest_idx].samples[0] = rssi;
+        rssi_tracker[oldest_idx].sample_count = 1;
+        rssi_tracker[oldest_idx].last_seen = now;
+        rssi_tracker[oldest_idx].scored = false;
+        return;
+    }
+    
+    // Add new
+    rssi_tracker[rssi_tracker_count].mac = mac;
+    rssi_tracker[rssi_tracker_count].samples[0] = rssi;
+    rssi_tracker[rssi_tracker_count].sample_count = 1;
+    rssi_tracker[rssi_tracker_count].last_seen = now;
+    rssi_tracker[rssi_tracker_count].scored = false;
+    rssi_tracker_count++;
+}
+
+// Returns true if this device shows a stationary RF signature (gradual rise-peak-fall).
+// Requires at least 3 samples. Checks if there's a clear peak (not monotonic).
+bool rssi_track_is_stationary(const String& mac) {
+    for (int i = 0; i < rssi_tracker_count; i++) {
+        if (rssi_tracker[i].mac == mac && rssi_tracker[i].sample_count >= 3 && !rssi_tracker[i].scored) {
+            int n = rssi_tracker[i].sample_count;
+            int* s = rssi_tracker[i].samples;
+            
+            // Find peak index
+            int peak_idx = 0;
+            for (int j = 1; j < n; j++) {
+                if (s[j] > s[peak_idx]) peak_idx = j;
+            }
+            
+            // Stationary signature: peak is NOT at the very start or end,
+            // and signal rises before peak and falls after (allowing some noise).
+            // Also: total RSSI variation must be >= 6 dBm (not just noise floor jitter).
+            int range = s[peak_idx] - min(s[0], s[n - 1]);
+            
+            if (peak_idx > 0 && peak_idx < n - 1 && range >= 6) {
+                rssi_tracker[i].scored = true;  // Only score once per device
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+// Expire stale entries periodically (called from main loop)
+void rssi_track_expire() {
+    unsigned long now = millis();
+    for (int i = rssi_tracker_count - 1; i >= 0; i--) {
+        if ((now - rssi_tracker[i].last_seen) > RSSI_TRACK_EXPIRY_MS) {
+            // Shift remaining entries down
+            for (int j = i; j < rssi_tracker_count - 1; j++) {
+                rssi_tracker[j] = rssi_tracker[j + 1];
+            }
+            rssi_tracker_count--;
+        }
+    }
+}
+
+// ============================================================================
+// WiFi SSID FORMAT VALIDATION
+// ============================================================================
+// Flock cameras use SSID format "Flock-XXXX" where XXXX is partial MAC in hex.
+// This is much more specific than a generic "flock" substring match.
+
+bool is_flock_ssid_format(const char* ssid) {
+    if (!ssid) return false;
+    // Check for "Flock-" prefix
+    if (strncmp(ssid, "Flock-", 6) != 0 && strncmp(ssid, "flock-", 6) != 0) return false;
+    // Remaining chars should be hex digits (at least 2)
+    const char* suffix = ssid + 6;
+    int len = strlen(suffix);
+    if (len < 2 || len > 12) return false;
+    for (int i = 0; i < len; i++) {
+        if (!isxdigit(suffix[i])) return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// PENGUIN / RAVEN HELPERS
+// ============================================================================
 
 bool is_penguin_numeric_name(const char* name) {
     if (!name) return false;
     int len = strlen(name);
-    if (len < 8 || len > 12) return false;  // Penguin serials are ~10 digits
+    if (len < 8 || len > 12) return false;
     for (int i = 0; i < len; i++) {
         if (!isdigit(name[i])) return false;
     }
     return true;
 }
 
-// Check if XUNTONG mfg data contains a Flock TN-serial pattern
-// Per GainSec: data includes serial like TN72023022000771 after the MAC bytes
 bool has_tn_serial(const std::string& mfg_data) {
     if (mfg_data.length() < 10) return false;
-    // Skip first 8 bytes (company ID + MAC echo), look for "TN" in ASCII
     for (size_t i = 8; i < mfg_data.length() - 1; i++) {
         if (mfg_data[i] == 'T' && mfg_data[i + 1] == 'N') return true;
     }
     return false;
 }
 
-// ============================================================================
-// RAVEN FIRMWARE FINGERPRINTING
-// ============================================================================
-
 String classify_raven_firmware(NimBLEAdvertisedDevice* device) {
     if (!device || !device->haveServiceUUID()) return "Unknown";
-    
     bool has_health = false, has_location = false;
     bool has_gps = false, has_power = false, has_network = false;
     bool has_upload = false, has_error = false;
-    
     int count = device->getServiceUUIDCount();
     for (int i = 0; i < count; i++) {
         std::string uuid = device->getServiceUUID(i).toString();
@@ -354,14 +498,12 @@ String classify_raven_firmware(NimBLEAdvertisedDevice* device) {
         if (strcasestr(uuid.c_str(), "00003400")) has_upload = true;
         if (strcasestr(uuid.c_str(), "00003500")) has_error = true;
     }
-    
     if (has_gps && has_power && has_network && has_upload && has_error) return "1.3.x";
     if (has_gps && has_power && has_network) return "1.2.x";
     if (has_health || has_location) return "1.1.x";
     return "Unknown";
 }
 
-// Count how many Raven UUIDs a device advertises (for confidence scoring)
 int count_raven_uuids(NimBLEAdvertisedDevice* device) {
     if (!device || !device->haveServiceUUID()) return 0;
     int matched = 0;
@@ -376,7 +518,7 @@ int count_raven_uuids(NimBLEAdvertisedDevice* device) {
 }
 
 // ============================================================================
-// PATTERN MATCHING FUNCTIONS
+// PATTERN MATCHING
 // ============================================================================
 
 bool check_mac_prefix(const uint8_t* mac) {
@@ -404,12 +546,6 @@ bool check_device_name_pattern(const char* name) {
     return false;
 }
 
-// Returns count of matched Raven UUIDs (0 = no match)
-int check_raven_service_uuid(NimBLEAdvertisedDevice* device) {
-    if (!device || !device->haveServiceUUID()) return 0;
-    return count_raven_uuids(device);
-}
-
 bool check_manufacturer_id(const std::string& mfg_data) {
     if (mfg_data.length() >= 2) {
         uint16_t mfg_id = (uint8_t)mfg_data[0] | ((uint8_t)mfg_data[1] << 8);
@@ -419,7 +555,24 @@ bool check_manufacturer_id(const std::string& mfg_data) {
 }
 
 // ============================================================================
-// LOGGING & ALERTS (with confidence scoring)
+// SD CARD
+// ============================================================================
+
+void flush_sd_buffer() {
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (sd_write_buffer.empty() || !sd_available) { xSemaphoreGive(dataMutex); return; }
+    std::vector<String> temp_buffer = sd_write_buffer;
+    sd_write_buffer.clear(); 
+    xSemaphoreGive(dataMutex); 
+    File file = SD.open(current_log_file.c_str(), FILE_APPEND);
+    if (file) {
+        for (const String &line : temp_buffer) { file.println(line); }
+        file.close(); last_sd_flush = millis();
+    }
+}
+
+// ============================================================================
+// LOGGING
 // ============================================================================
 
 void log_detection(const char* type, const char* proto, int rssi, const char* mac, 
@@ -429,24 +582,26 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     
-    bool is_new = !is_mac_seen(mac_str);
+    bool is_new = !is_mac_recently_seen(mac_str);
+    if (is_new) add_seen_mac(mac_str);
 
+    // Always update counters for new-to-window detections
     if (is_new) {
-        add_seen_mac(mac_str);
         if (strcmp(proto, "WIFI") == 0) { session_wifi++; lifetime_wifi++; session_flock_wifi++; }
         else { session_ble++; lifetime_ble++; }
-        if (strstr(type, "RAVEN") != NULL) { session_raven++; }
-        else if (strcmp(proto, "BLE") == 0) { session_flock_ble++; }
+        if (strstr(type, "RAVEN") != NULL) session_raven++;
+        else if (strcmp(proto, "BLE") == 0) session_flock_ble++;
+        lifetime_flock_total++;
     }
 
     last_cap_type = String(type);
-    last_cap_mac = String(mac);
+    last_cap_mac = mac_str;
     last_cap_rssi = rssi;
     last_cap_confidence = confidence;
     last_cap_time = format_time((millis() - session_start_time) / 1000);
     last_cap_det_method = String(detection_method);
 
-    // Build display log entry
+    // Live log entry
     String logEntry;
     if (name != "Hidden" && name != "Unknown" && name != "") {
         String cleanName = name;
@@ -455,30 +610,25 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
     } else {
         logEntry = "!" + String(proto) + " " + short_mac(mac_str) + " " + String(confidence) + "%";
     }
-    
     if (millis() - last_log_update > LOG_UPDATE_DELAY) {
-        for (int i = 4; i > 0; i--) { live_logs[i] = live_logs[i - 1]; }
+        for (int i = 4; i > 0; i--) live_logs[i] = live_logs[i - 1];
         live_logs[0] = logEntry;
         last_log_update = millis();
     }
     
-    // CSV logging to SD
+    // CSV to SD
     if (is_new && sd_available) {
         String clean_name = name; clean_name.replace(",", " "); 
         String clean_extra = extra_data; clean_extra.replace(",", " ");
-
         String csv_line;
         csv_line.reserve(200); 
-        
         csv_line = String(millis()) + "," + get_gps_datetime() + "," + 
                    String(channel) + "," + String(type) + "," + String(proto) + "," + 
                    String(rssi) + "," + mac_str + "," + clean_name + "," + 
                    String(tx_power) + "," + String(detection_method) + "," +
                    String(confidence) + "," + String(confidence_label(confidence)) + "," +
                    clean_extra + ",";
-        
         bool gps_is_fresh = gps.location.isValid() && (gps.location.age() < 2000);
-        
         if (gps_is_fresh) {
             csv_line += String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6) + ",";
             csv_line += String(gps.speed.isValid() && gps.speed.age() < 2000 ? gps.speed.mph() : 0.0, 1) + ",";
@@ -494,12 +644,17 @@ void log_detection(const char* type, const char* proto, int rssi, const char* ma
 }
 
 // ============================================================================
-// CORE 0 SCANNER TASK
+// CORE 0 SCANNER TASK (Adaptive Channel Dwell)
 // ============================================================================
 void ScannerLoopTask(void * pvParameters) {
     for (;;) {
         unsigned long now = millis();
-        if (now - last_channel_hop > CHANNEL_HOP_INTERVAL) {
+        
+        // Adaptive dwell: longer on primary channels (1, 6, 11)
+        bool is_primary = (current_channel == 1 || current_channel == 6 || current_channel == 11);
+        unsigned long dwell = is_primary ? DWELL_PRIMARY : DWELL_SECONDARY;
+        
+        if (now - last_channel_hop > dwell) {
             current_channel++;
             if (current_channel > MAX_CHANNEL) current_channel = 1;
             esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
@@ -515,13 +670,12 @@ void ScannerLoopTask(void * pvParameters) {
         if (!pBLEScan->isScanning() && (millis() - last_ble_scan > (unsigned long)(BLE_SCAN_DURATION * 1000 + 500))) {
             pBLEScan->clearResults();
         }
-        
         vTaskDelay(10 / portTICK_PERIOD_MS); 
     }
 }
 
 // ============================================================================
-// WIFI PACKET HANDLER (with confidence scoring)
+// WIFI PACKET HANDLER
 // ============================================================================
 typedef struct {
     unsigned frame_ctrl:16; unsigned duration_id:16;
@@ -531,29 +685,23 @@ typedef struct {
 typedef struct { wifi_ieee80211_mac_hdr_t hdr; uint8_t payload[0]; } wifi_ieee80211_packet_t;
 
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
-    // PERF: Early exit for non-management frames at the type level
     if (type != WIFI_PKT_MGMT) return;
-    
     const wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
     if (ppkt->rx_ctrl.sig_len < 24) return;
-    
     const wifi_ieee80211_packet_t *ipkt = (wifi_ieee80211_packet_t *)ppkt->payload;
     const wifi_ieee80211_mac_hdr_t *hdr = &ipkt->hdr;
     
     uint8_t frame_type = (hdr->frame_ctrl & 0x0C) >> 2;
     uint8_t frame_subtype = (hdr->frame_ctrl & 0xF0) >> 4;
-    
     if (frame_type != 0) return;
     bool is_beacon = (frame_subtype == 8);
     bool is_probe_req = (frame_subtype == 4);
     if (!is_beacon && !is_probe_req) return;
     
-    // Extract SSID
     char ssid[33] = {0};
     uint8_t *frame_body = (uint8_t *)ipkt + 24;
     uint8_t *tagged_params;
     int remaining;
-    
     if (is_beacon) {
         if (ppkt->rx_ctrl.sig_len < 24 + 12 + 2) return;
         tagged_params = frame_body + 12;
@@ -562,26 +710,28 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
         tagged_params = frame_body;
         remaining = ppkt->rx_ctrl.sig_len - 24 - 4;
     }
-    
     if (remaining > 2 && tagged_params[0] == 0 && tagged_params[1] <= 32 && tagged_params[1] <= remaining - 2) {
         memcpy(ssid, &tagged_params[2], tagged_params[1]);
         ssid[tagged_params[1]] = '\0';
     }
     
-    // --- Confidence scoring for WiFi ---
+    // --- Confidence scoring ---
     int confidence = 0;
     String methods = "";
     
-    bool ssid_match = (strlen(ssid) > 0 && check_ssid_pattern(ssid));
     bool mac_match = check_mac_prefix(hdr->addr2);
+    bool ssid_generic = (strlen(ssid) > 0 && check_ssid_pattern(ssid));
+    bool ssid_flock_fmt = (strlen(ssid) > 0 && is_flock_ssid_format(ssid));
     
-    if (ssid_match) { confidence += CONF_SSID_PATTERN; methods += "ssid "; }
-    if (mac_match)  { confidence += CONF_MAC_PREFIX;    methods += "mac "; }
+    if (ssid_flock_fmt)      { confidence += CONF_SSID_FLOCK_FMT; methods += "ssid_fmt "; }
+    else if (ssid_generic)   { confidence += CONF_SSID_PATTERN;    methods += "ssid "; }
+    if (mac_match)           { confidence += CONF_MAC_PREFIX;      methods += "mac "; }
     
-    // Bonus: both methods matched independently
-    if (ssid_match && mac_match) confidence += CONF_BONUS_MULTI_METHOD;
-    
-    // Bonus: strong signal
+    // Multi-method bonus
+    int wifi_methods = 0;
+    if (ssid_flock_fmt || ssid_generic) wifi_methods++;
+    if (mac_match) wifi_methods++;
+    if (wifi_methods >= 2) confidence += CONF_BONUS_MULTI_METHOD;
     if (ppkt->rx_ctrl.rssi > -50) confidence += CONF_BONUS_STRONG_RSSI;
 
     char mac_str[18]; 
@@ -591,34 +741,40 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     String name_str = strlen(ssid) > 0 ? String(ssid) : "Hidden";
     String frame_type_str = is_beacon ? "Beacon" : "ProbeReq";
 
+    // RSSI trend tracking for matched devices
     if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
+        rssi_track_update(String(mac_str), ppkt->rx_ctrl.rssi);
+        if (rssi_track_is_stationary(String(mac_str))) {
+            confidence += CONF_BONUS_STATIONARY;
+        }
+        if (confidence > 100) confidence = 100;
+        
         methods.trim();
         log_detection("FLOCK_WIFI", "WIFI", ppkt->rx_ctrl.rssi, mac_str, name_str, 
                       ppkt->rx_ctrl.channel, 0, frame_type_str, methods.c_str(), confidence);
         if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
-            trigger_alarm = true; last_buzzer_time = millis();
+            trigger_alarm_confidence = confidence;
+            last_buzzer_time = millis();
         }
     } else if (ppkt->rx_ctrl.rssi > IGNORE_WEAK_RSSI) {
         if (millis() - last_log_update > LOG_UPDATE_DELAY) {
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             String logEntry;
             if (name_str != "Hidden" && name_str != "") {
-                String cleanName = name_str; 
-                if (cleanName.length() > 12) cleanName = cleanName.substring(0, 12);
-                logEntry = cleanName + " (" + String(ppkt->rx_ctrl.rssi) + ")";
+                String cn = name_str; if (cn.length() > 12) cn = cn.substring(0, 12);
+                logEntry = cn + " (" + String(ppkt->rx_ctrl.rssi) + ")";
             } else {
                 logEntry = "WiFi " + short_mac(String(mac_str)) + " (" + String(ppkt->rx_ctrl.rssi) + ")";
             }
-            for (int i = 4; i > 0; i--) { live_logs[i] = live_logs[i - 1]; }
-            live_logs[0] = logEntry;
-            last_log_update = millis();
+            for (int i = 4; i > 0; i--) live_logs[i] = live_logs[i - 1];
+            live_logs[0] = logEntry; last_log_update = millis();
             xSemaphoreGive(dataMutex);
         }
     }
 }
 
 // ============================================================================
-// BLE CALLBACK (with confidence scoring)
+// BLE CALLBACK
 // ============================================================================
 class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
@@ -627,64 +783,67 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
         sscanf(addr.toString().c_str(), "%02x:%02x:%02x:%02x:%02x:%02x", 
                &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
         
-        // --- Build confidence score from multiple independent signals ---
         int confidence = 0;
         String methods = "";
         String capture_type = "FLOCK_BLE";
-        bool has_xuntong = false;
         
-        // Check MAC prefix
-        if (check_mac_prefix(mac)) { 
-            confidence += CONF_MAC_PREFIX; 
-            methods += "mac ";
-        }
+        // MAC prefix
+        if (check_mac_prefix(mac)) { confidence += CONF_MAC_PREFIX; methods += "mac "; }
         
-        // Check device name
+        // Device name
         String dev_name = advertisedDevice->haveName() ? String(advertisedDevice->getName().c_str()) : "Unknown";
         if (advertisedDevice->haveName()) {
             if (check_device_name_pattern(advertisedDevice->getName().c_str())) {
-                confidence += CONF_BLE_NAME;
-                methods += "name ";
-            }
-            // Check for updated Penguin numeric-only name
-            else if (is_penguin_numeric_name(advertisedDevice->getName().c_str())) {
-                // Low confidence alone — could be any device with a numeric name
-                // Will be boosted significantly if paired with XUNTONG mfg ID below
-                confidence += 15;
-                methods += "penguin_num ";
+                confidence += CONF_BLE_NAME; methods += "name ";
+            } else if (is_penguin_numeric_name(advertisedDevice->getName().c_str())) {
+                confidence += 15; methods += "penguin_num ";
             }
         }
         
-        // Check manufacturer company ID
+        // Manufacturer ID
+        bool has_xuntong = false;
         if (advertisedDevice->haveManufacturerData()) {
             std::string mfg = advertisedDevice->getManufacturerData();
             if (check_manufacturer_id(mfg)) {
                 has_xuntong = true;
-                confidence += CONF_MFG_ID;
-                methods += "mfg_0x09C8 ";
-                
-                // Extra: check for TN serial in mfg data (very specific to Flock)
+                confidence += CONF_MFG_ID; methods += "mfg_0x09C8 ";
                 if (has_tn_serial(mfg)) {
-                    confidence += CONF_PENGUIN_SERIAL - CONF_MFG_ID; // Add difference to avoid double-counting
+                    confidence += (CONF_PENGUIN_SERIAL - CONF_MFG_ID);
                     methods += "tn_serial ";
                 }
             }
         }
         
-        // Check Raven UUIDs
-        int raven_uuid_count = check_raven_service_uuid(advertisedDevice);
+        // Raven UUIDs
+        int raven_uuid_count = count_raven_uuids(advertisedDevice);
         if (raven_uuid_count > 0) {
             capture_type = "RAVEN_BLE";
-            if (raven_uuid_count >= 3) {
-                confidence += CONF_RAVEN_MULTI_UUID;
-                methods += "raven_multi ";
-            } else {
-                confidence += CONF_RAVEN_UUID;
-                methods += "raven_uuid ";
-            }
+            if (raven_uuid_count >= 3) { confidence += CONF_RAVEN_MULTI_UUID; methods += "raven_multi "; }
+            else { confidence += CONF_RAVEN_UUID; methods += "raven_uuid "; }
         }
         
-        // Bonus: multiple independent methods
+        // BLE address type check: random static addresses are consistent across power
+        // cycles (Flock batteries use these). Random resolvable addresses rotate every
+        // ~15 min (phones/wearables). Public addresses are also good (fixed by manufacturer).
+        uint8_t addr_type = addr.getType();
+        // NimBLE: 0 = public, 1 = random
+        // For random addresses: bit 7:6 of first octet: 11 = static, 01 = resolvable, 00 = non-resolvable
+        if (addr_type == 0) {
+            // Public address — good, fixed by manufacturer
+            confidence += CONF_BONUS_BLE_STATIC_ADDR;
+            methods += "pub_addr ";
+        } else if (addr_type == 1) {
+            uint8_t top_bits = mac[0] >> 6;
+            if (top_bits == 0x03) {
+                // Random static — consistent across power cycles (Flock batteries use this)
+                confidence += CONF_BONUS_BLE_STATIC_ADDR;
+                methods += "static_addr ";
+            }
+            // Random resolvable (top_bits == 0x01) — phone-like, no bonus
+            // Random non-resolvable (top_bits == 0x00) — very transient, no bonus
+        }
+        
+        // Multi-method bonus
         int method_count = 0;
         if (methods.indexOf("mac") >= 0) method_count++;
         if (methods.indexOf("name") >= 0 || methods.indexOf("penguin_num") >= 0) method_count++;
@@ -692,29 +851,34 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
         if (methods.indexOf("raven") >= 0) method_count++;
         if (method_count >= 2) confidence += CONF_BONUS_MULTI_METHOD;
         
-        // Bonus: strong signal
         if (advertisedDevice->getRSSI() > -50) confidence += CONF_BONUS_STRONG_RSSI;
         
-        // Cap at 100
+        // RSSI trend tracking
+        String mac_string = String(addr.toString().c_str());
+        if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
+            rssi_track_update(mac_string, advertisedDevice->getRSSI());
+            if (rssi_track_is_stationary(mac_string)) {
+                confidence += CONF_BONUS_STATIONARY;
+            }
+        }
+        
         if (confidence > 100) confidence = 100;
 
         if (confidence >= CONFIDENCE_ALARM_THRESHOLD) {
             int tx_power = advertisedDevice->haveTXPower() ? advertisedDevice->getTXPower() : 0;
-            String mfg_data_hex = advertisedDevice->haveManufacturerData() ? 
+            String mfg_hex = advertisedDevice->haveManufacturerData() ? 
                 bytesToHexStr(advertisedDevice->getManufacturerData()) : "";
             
-            // Build extra data
-            String extra_data = mfg_data_hex;
+            String extra_data = mfg_hex;
             if (capture_type == "RAVEN_BLE") {
-                String fw_ver = classify_raven_firmware(advertisedDevice);
-                extra_data = "FW:" + fw_ver + " UUIDs:" + String(raven_uuid_count);
+                String fw = classify_raven_firmware(advertisedDevice);
+                extra_data = "FW:" + fw + " UUIDs:" + String(raven_uuid_count);
                 if (advertisedDevice->haveServiceUUID()) {
                     extra_data += " SVCS:";
-                    int svc_count = advertisedDevice->getServiceUUIDCount();
-                    for (int i = 0; i < svc_count && i < 8; i++) {
+                    int sc = advertisedDevice->getServiceUUIDCount();
+                    for (int i = 0; i < sc && i < 8; i++) {
                         if (i > 0) extra_data += "|";
-                        std::string u = advertisedDevice->getServiceUUID(i).toString();
-                        extra_data += String(u.c_str()).substring(0, 8);
+                        extra_data += String(advertisedDevice->getServiceUUID(i).toString().c_str()).substring(0, 8);
                     }
                 }
             }
@@ -725,22 +889,21 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
                           methods.c_str(), confidence);
             
             if (millis() - last_buzzer_time > BUZZER_COOLDOWN || last_buzzer_time == 0) {
-                trigger_alarm = true; last_buzzer_time = millis();
+                trigger_alarm_confidence = confidence;
+                last_buzzer_time = millis();
             }
         } else if (advertisedDevice->getRSSI() > IGNORE_WEAK_RSSI) {
             if (millis() - last_log_update > LOG_UPDATE_DELAY) {
                 xSemaphoreTake(dataMutex, portMAX_DELAY);
                 String logEntry;
                 if (dev_name != "Unknown" && dev_name != "") {
-                    String cleanName = dev_name; 
-                    if (cleanName.length() > 12) cleanName = cleanName.substring(0, 12);
-                    logEntry = cleanName + " (" + String(advertisedDevice->getRSSI()) + ")";
+                    String cn = dev_name; if (cn.length() > 12) cn = cn.substring(0, 12);
+                    logEntry = cn + " (" + String(advertisedDevice->getRSSI()) + ")";
                 } else {
-                    logEntry = "BLE " + short_mac(String(addr.toString().c_str())) + " (" + String(advertisedDevice->getRSSI()) + ")";
+                    logEntry = "BLE " + short_mac(mac_string) + " (" + String(advertisedDevice->getRSSI()) + ")";
                 }
-                for (int i = 4; i > 0; i--) { live_logs[i] = live_logs[i - 1]; }
-                live_logs[0] = logEntry;
-                last_log_update = millis();
+                for (int i = 4; i > 0; i--) live_logs[i] = live_logs[i - 1];
+                live_logs[0] = logEntry; last_log_update = millis();
                 xSemaphoreGive(dataMutex);
             }
         }
@@ -765,10 +928,7 @@ void draw_header() {
 
 void update_animation() {
     int y_min = 28, y_max = 52;
-    display.drawFastVLine(scan_line_x, y_min, (y_max - y_min), SSD1306_BLACK);
-    display.drawFastVLine(scan_line_x + 1, y_min, (y_max - y_min), SSD1306_BLACK);
-    display.drawFastVLine(scan_line_x + 2, y_min, (y_max - y_min), SSD1306_BLACK);
-    display.drawFastVLine(scan_line_x + 3, y_min, (y_max - y_min), SSD1306_BLACK);
+    for (int i = 0; i < 4; i++) display.drawFastVLine(scan_line_x + i, y_min, (y_max - y_min), SSD1306_BLACK);
     if (random(0, 100) < 75) display.drawPixel(random(0, 128), random(y_min, y_max), SSD1306_WHITE);
     scan_line_x += 4; if (scan_line_x >= 128) scan_line_x = 0;
     display.drawFastVLine(scan_line_x, y_min, (y_max - y_min), SSD1306_WHITE);
@@ -779,21 +939,22 @@ void draw_scanner_screen() {
     if (millis() - last_uptime_update > 1000) {
         display.fillRect(0, 56, 128, 8, SSD1306_BLACK);
         display.drawBitmap(0, 56, clock_icon, 8, 8, SSD1306_WHITE);
-        display.setCursor(12, 56);
-        display.print(format_time((millis() - session_start_time) / 1000));
+        display.setCursor(12, 56); display.print(format_time((millis() - session_start_time) / 1000));
         if (sd_available) { display.setCursor(100, 56); display.print(F("SD:OK")); }
         display.fillRect(0, 16, 128, 10, SSD1306_BLACK); display.setCursor(0, 16);
         if (pBLEScan->isScanning()) display.print(F("Scanning: BLE..."));
-        else { display.print(F("Scan Ch:")); display.print(current_channel); display.print(F(" WiFi")); }
+        else {
+            display.print(F("Ch:")); display.print(current_channel);
+            bool pri = (current_channel == 1 || current_channel == 6 || current_channel == 11);
+            display.print(pri ? F(" WiFi*") : F(" WiFi"));
+        }
         display.fillRect(100, 0, 28, 10, SSD1306_BLACK); 
         int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
-        String sat_str = String(sats);
-        int16_t x1, y1; uint16_t w, h;
-        display.getTextBounds(sat_str, 0, 0, &x1, &y1, &w, &h);
+        String ss = String(sats); int16_t x1, y1; uint16_t w, h;
+        display.getTextBounds(ss, 0, 0, &x1, &y1, &w, &h);
         display.drawBitmap(128 - w - 10, 0, map_pin_icon, 8, 8, SSD1306_WHITE);
-        display.setCursor(128 - w, 0); display.print(sat_str);
-        display.display();
-        last_uptime_update = millis();
+        display.setCursor(128 - w, 0); display.print(ss);
+        display.display(); last_uptime_update = millis();
     }
 }
 
@@ -801,14 +962,16 @@ void draw_stats_screen() {
     if (millis() - last_stats_update > 500) {
         xSemaphoreTake(dataMutex, portMAX_DELAY); 
         long tw = session_flock_wifi, tb = session_flock_ble, tr = session_raven;
-        long lw = lifetime_wifi, lb = lifetime_ble;
+        long lw = lifetime_wifi, lb = lifetime_ble, lt = lifetime_flock_total;
+        unsigned long ls = lifetime_seconds;
         xSemaphoreGive(dataMutex);
         display.clearDisplay(); draw_header();
         display.setCursor(0, 13); display.print(F("Detections"));
-        display.setCursor(50, 24); display.print(F("SESS"));  display.setCursor(90, 24); display.print(F("ALL"));
-        display.setCursor(0, 34); display.print(F("WiFi:"));  display.setCursor(50, 34); display.print(tw); display.setCursor(90, 34); display.print(lw);
-        display.setCursor(0, 44); display.print(F("BLE:"));   display.setCursor(50, 44); display.print(tb); display.setCursor(90, 44); display.print(lb);
-        display.setCursor(0, 54); display.print(F("Raven:")); display.setCursor(50, 54); display.print(tr);
+        display.setCursor(50, 24); display.print(F("SESS")); display.setCursor(90, 24); display.print(F("ALL"));
+        display.setCursor(0, 34); display.print(F("WiFi:")); display.setCursor(50, 34); display.print(tw); display.setCursor(90, 34); display.print(lw);
+        display.setCursor(0, 44); display.print(F("BLE:"));  display.setCursor(50, 44); display.print(tb); display.setCursor(90, 44); display.print(lb);
+        display.setCursor(0, 54); display.print(F("Rvn:")); display.setCursor(50, 54); display.print(tr); 
+        display.setCursor(70, 54); display.print(F("T:")); display.print(format_time(ls));
         display.display(); last_stats_update = millis();
     }
 }
@@ -822,17 +985,13 @@ void draw_last_capture_screen() {
         xSemaphoreGive(dataMutex);
         display.clearDisplay(); draw_header();
         display.setCursor(0, 13); display.print(F("Last Capture"));
-        if (t_type == "None") { 
-            display.setCursor(0, 35); display.print(F("NO DATA YET")); 
-        } else {
+        if (t_type == "None") { display.setCursor(0, 35); display.print(F("NO DATA YET")); } 
+        else {
             display.setCursor(0, 24); display.print(F("T:")); display.print(t_time);
             display.setCursor(64, 24); display.print(F("R:")); display.print(t_rssi);
             display.setCursor(0, 34); display.print(t_type);
             display.setCursor(0, 44); display.print(t_mac);
-            // Show confidence score + label
-            display.setCursor(0, 54); 
-            display.print(F("Conf: ")); display.print(t_conf); display.print(F("% "));
-            display.print(confidence_label(t_conf));
+            display.setCursor(0, 54); display.print(String(t_conf) + "% " + String(confidence_label(t_conf)));
         }
         display.display(); last_stats_update = millis();
     }
@@ -862,17 +1021,16 @@ void draw_gps_screen() {
     if (millis() - last_stats_update > 500) {
         display.clearDisplay(); draw_header();
         display.setCursor(0, 13); display.print(F("GPS Coordinates"));
-        bool has_location = gps.location.isValid();
-        bool is_stale = has_location && (gps.location.age() > 2000);
-        if (has_location && !is_stale) {
+        bool has_loc = gps.location.isValid();
+        bool stale = has_loc && (gps.location.age() > 2000);
+        if (has_loc && !stale) {
             display.setCursor(0, 26); display.print(F("Lat: ")); display.print(gps.location.lat(), 6);
             display.setCursor(0, 38); display.print(F("Lon: ")); display.print(gps.location.lng(), 6);
             display.setCursor(0, 50); display.print(F("Spd: ")); display.print(gps.speed.mph(), 1); 
             display.print(F(" Hdg: ")); display.print(gps.course.deg(), 0);
-        } else if (has_location && is_stale) {
+        } else if (has_loc && stale) {
             display.setCursor(0, 26); display.print(F("STATUS: SIGNAL LOST"));
-            display.setCursor(0, 38); display.print(F("Last Lock: ")); 
-            display.print(gps.location.age() / 1000); display.print(F("s ago"));
+            display.setCursor(0, 38); display.print(F("Last: ")); display.print(gps.location.age()/1000); display.print(F("s ago"));
             display.setCursor(0, 50); display.print(F("Waiting for sats..."));
         } else {
             int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
@@ -889,13 +1047,10 @@ void draw_chart_screen() {
         display.clearDisplay(); draw_header();
         display.setCursor(0, 13); display.print(F("Activity (Last 25s)"));
         int max_val = 1; 
-        for (int i = 0; i < CHART_BARS; i++) {
-            if (activity_history[i] > max_val) max_val = activity_history[i];
-        }
+        for (int i = 0; i < CHART_BARS; i++) { if (activity_history[i] > max_val) max_val = activity_history[i]; }
         for (int i = 0; i < CHART_BARS; i++) {
             int bar_h = (activity_history[i] * 35) / max_val;
-            int x = i * 5;
-            display.fillRect(x, 64 - bar_h, 4, bar_h, SSD1306_WHITE);
+            display.fillRect(i * 5, 64 - bar_h, 4, bar_h, SSD1306_WHITE);
         }
         display.display(); last_stats_update = millis();
     }
@@ -904,20 +1059,16 @@ void draw_chart_screen() {
 void draw_proximity_screen() {
     if (millis() - last_stats_update > 250) {
         xSemaphoreTake(dataMutex, portMAX_DELAY);
-        int rssi = last_cap_rssi;
-        String cap_type = last_cap_type;
-        int conf = last_cap_confidence;
+        int rssi = last_cap_rssi; String cap_type = last_cap_type; int conf = last_cap_confidence;
         xSemaphoreGive(dataMutex);
         display.clearDisplay(); draw_header();
         display.setCursor(0, 13); display.print(F("Signal Proximity"));
-        if (cap_type == "None") {
-            display.setCursor(0, 35); display.print(F("NO DATA YET"));
-        } else {
+        if (cap_type == "None") { display.setCursor(0, 35); display.print(F("NO DATA YET")); }
+        else {
             int pct = constrain(map(rssi, -100, -30, 0, 100), 0, 100);
             int bar_w = (pct * 120) / 100;
-            display.setCursor(0, 24); 
-            display.print(F("RSSI: ")); display.print(rssi); display.print(F("dBm "));
-            display.print(conf); display.print(F("%"));
+            display.setCursor(0, 24); display.print(F("RSSI:")); display.print(rssi); 
+            display.print(F("dBm ")); display.print(conf); display.print(F("%"));
             display.drawRect(3, 36, 122, 12, SSD1306_WHITE);
             if (bar_w > 0) display.fillRect(4, 37, bar_w, 10, SSD1306_WHITE);
             display.setCursor(0, 52);
@@ -936,6 +1087,44 @@ void refresh_screen_layout() {
 }
 
 // ============================================================================
+// ALARM ESCALATION
+// ============================================================================
+// MEDIUM (40-69): 1 short beep — "something might be here"
+// HIGH (70-84):   3 beeps at higher pitch — "likely detection"
+// CERTAIN (85+):  5 rapid beeps at highest pitch + longer invert — "confirmed device"
+
+void play_escalated_alarm(int confidence) {
+    if (confidence >= CONFIDENCE_CERTAIN) {
+        // CERTAIN: 5 rapid high-pitch beeps
+        for (int i = 0; i < 5; i++) {
+            if (!stealth_mode) display.invertDisplay(true);
+            if (!stealth_mode) tone(BUZZER_PIN, DETECT_FREQ_CERTAIN); 
+            delay(100);
+            noTone(BUZZER_PIN);
+            if (!stealth_mode) display.invertDisplay(false);
+            if (i < 4) delay(30);
+        }
+    } else if (confidence >= CONFIDENCE_HIGH) {
+        // HIGH: 3 beeps
+        for (int i = 0; i < 3; i++) {
+            if (!stealth_mode) display.invertDisplay(true);
+            if (!stealth_mode) tone(BUZZER_PIN, DETECT_FREQ_HIGH); 
+            delay(DETECT_BEEP_DURATION);
+            noTone(BUZZER_PIN);
+            if (!stealth_mode) display.invertDisplay(false);
+            if (i < 2) delay(50);
+        }
+    } else {
+        // MEDIUM: 1 short beep
+        if (!stealth_mode) display.invertDisplay(true);
+        if (!stealth_mode) tone(BUZZER_PIN, DETECT_FREQ);
+        delay(DETECT_BEEP_DURATION);
+        noTone(BUZZER_PIN);
+        if (!stealth_mode) display.invertDisplay(false);
+    }
+}
+
+// ============================================================================
 // SETUP
 // ============================================================================
 
@@ -950,21 +1139,22 @@ void setup() {
     pinMode(SD_CS_PIN, OUTPUT); digitalWrite(SD_CS_PIN, HIGH); 
     SPI.begin(); 
 
-    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) { 
-        Serial.println(F("SSD1306 failed")); 
-    }
+    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) Serial.println(F("SSD1306 failed"));
     Wire.setClock(400000); display.setRotation(2); 
     
-    // SD card init with retry
-    bool mount_success = false;
-    for (int i = 0; i < 3; i++) { 
-        if (SD.begin(SD_CS_PIN)) { mount_success = true; break; } 
-        delay(100); 
+    // Initialize LittleFS for session persistence
+    if (!LittleFS.begin(true)) {  // true = format on first use
+        Serial.println(F("LittleFS mount failed"));
+    } else {
+        load_session_from_flash();
     }
+    
+    // SD card
+    bool mount_success = false;
+    for (int i = 0; i < 3; i++) { if (SD.begin(SD_CS_PIN)) { mount_success = true; break; } delay(100); }
     if (mount_success) {
         sd_available = true;
-        int file_num = 1;
-        char file_name[32];
+        int file_num = 1; char file_name[32];
         while (file_num <= 999) {
             sprintf(file_name, "/FlockLog_%03d.csv", file_num);
             if (!SD.exists(file_name)) { current_log_file = String(file_name); break; }
@@ -980,39 +1170,35 @@ void setup() {
     
     session_start_time = millis(); refresh_screen_layout();
 
-    // WiFi promiscuous mode
-    WiFi.mode(WIFI_STA); WiFi.disconnect(); 
-    esp_wifi_set_ps(WIFI_PS_NONE); 
-    
-    // PERF: Set promiscuous filter to only receive management frames
+    // WiFi promiscuous mode with MGMT-only filter
+    WiFi.mode(WIFI_STA); WiFi.disconnect(); esp_wifi_set_ps(WIFI_PS_NONE); 
     wifi_promiscuous_filter_t filt;
     filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
     esp_wifi_set_promiscuous_filter(&filt);
-    
     esp_wifi_set_promiscuous(true); 
     esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
     esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
     
-    // BLE setup
-    NimBLEDevice::init(""); 
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9); 
+    // BLE
+    NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9); 
     pBLEScan = NimBLEDevice::getScan(); 
-    pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false); // false = don't report duplicates
+    pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
     pBLEScan->setActiveScan(true); 
-    pBLEScan->setInterval(97);   // PERF: Prime number intervals reduce aliasing with advert intervals
-    pBLEScan->setWindow(97);     // PERF: 100% duty cycle scan window
+    pBLEScan->setInterval(97); pBLEScan->setWindow(97);
 
     boot_beep_sequence();
-    last_channel_hop = millis(); last_sd_flush = millis();
+    last_channel_hop = millis(); last_sd_flush = millis(); last_persist_save = millis();
 
     xTaskCreatePinnedToCore(ScannerLoopTask, "ScannerTask", 8192, NULL, 1, &ScannerTaskHandle, 0);
     
-    Serial.println(F("=== Flock Detector v2.1 — Confidence Scoring ==="));
-    Serial.print(F("MAC prefixes: ")); Serial.println(NUM_MAC_PREFIXES);
-    Serial.print(F("SSID patterns: ")); Serial.println(NUM_SSID_PATTERNS);
-    Serial.print(F("BLE name patterns: ")); Serial.println(NUM_NAME_PATTERNS);
-    Serial.print(F("Raven UUIDs: ")); Serial.println(NUM_RAVEN_UUIDS);
-    Serial.print(F("Alarm threshold: ")); Serial.print(CONFIDENCE_ALARM_THRESHOLD); Serial.println(F("%"));
+    Serial.println(F("=== Flock Detector v3.0 ==="));
+    Serial.print(F("MAC:")); Serial.print(NUM_MAC_PREFIXES);
+    Serial.print(F(" SSID:")); Serial.print(NUM_SSID_PATTERNS);
+    Serial.print(F(" BLE:")); Serial.print(NUM_NAME_PATTERNS);
+    Serial.print(F(" Raven:")); Serial.println(NUM_RAVEN_UUIDS);
+    Serial.print(F("Alarm threshold:")); Serial.print(CONFIDENCE_ALARM_THRESHOLD);
+    Serial.print(F("% Redetect window:")); Serial.print(REDETECT_WINDOW_MS / 1000);
+    Serial.println(F("s"));
 }
 
 // ============================================================================
@@ -1022,11 +1208,7 @@ void setup() {
 #define NUM_SCREENS 7
 
 void loop() {
-    // Feed GPS parser
-    while (SerialGPS.available() > 0) { 
-        gps.encode(SerialGPS.read()); 
-        yield(); 
-    }
+    while (SerialGPS.available() > 0) { gps.encode(SerialGPS.read()); yield(); }
 
     // Activity chart
     if (millis() - last_chart_update >= 1000) {
@@ -1040,39 +1222,39 @@ void loop() {
         activity_history[CHART_BARS - 1] = new_dets;
     }
 
-    // Alarm
-    if (trigger_alarm) {
-        trigger_alarm = false; 
-        for (int i = 0; i < 3; i++) {
-            if (!stealth_mode) display.invertDisplay(true);
-            if (!stealth_mode) tone(BUZZER_PIN, DETECT_FREQ); 
-            delay(DETECT_BEEP_DURATION);
-            noTone(BUZZER_PIN);
-            if (!stealth_mode) display.invertDisplay(false);
-            if (i < 2) delay(50);
-        }
+    // Escalated alarm
+    if (trigger_alarm_confidence > 0) {
+        int conf = trigger_alarm_confidence;
+        trigger_alarm_confidence = 0;
+        play_escalated_alarm(conf);
     }
 
     // Button
-    bool current_button_state = (digitalRead(BUTTON_PIN) == LOW);
-    if (current_button_state && !button_is_pressed) {
-        button_press_start = millis();
-        button_is_pressed = true;
-    } else if (!current_button_state && button_is_pressed) {
-        unsigned long press_duration = millis() - button_press_start;
+    bool btn = (digitalRead(BUTTON_PIN) == LOW);
+    if (btn && !button_is_pressed) { button_press_start = millis(); button_is_pressed = true; }
+    else if (!btn && button_is_pressed) {
+        unsigned long dur = millis() - button_press_start;
         button_is_pressed = false;
-        if (press_duration > 1000) {
+        if (dur > 1000) {
             stealth_mode = !stealth_mode;
             display.ssd1306_command(stealth_mode ? SSD1306_DISPLAYOFF : SSD1306_DISPLAYON);
             if (!stealth_mode) refresh_screen_layout();
-        } else if (press_duration > 50 && !stealth_mode) {
-            current_screen++;
-            if (current_screen >= NUM_SCREENS) current_screen = 0;
+        } else if (dur > 50 && !stealth_mode) {
+            current_screen++; if (current_screen >= NUM_SCREENS) current_screen = 0;
             refresh_screen_layout();
         }
     }
 
+    // Lifetime timer
     if (millis() - last_time_save >= 1000) { lifetime_seconds++; last_time_save = millis(); }
+
+    // Session persistence to flash
+    if (millis() - last_persist_save >= PERSIST_INTERVAL_MS) {
+        save_session_to_flash();
+    }
+
+    // RSSI tracker expiry
+    rssi_track_expire();
 
     // SD flush
     xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -1081,7 +1263,7 @@ void loop() {
     xSemaphoreGive(dataMutex);
     if (should_flush) flush_sd_buffer();
 
-    // Screen rendering
+    // Screens
     if (!stealth_mode) {
         switch (current_screen) {
             case 0:

